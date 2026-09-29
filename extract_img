@@ -1,0 +1,167 @@
+#!/usr/bin/env ruby
+
+require "optparse"
+require "fileutils"
+require "base64"
+
+options = {
+  inputs: [],
+  output_dir: ".",
+  naming: "incremental",
+  overwrite: false,
+  extract_scope: "images_only",
+  detect_formats: true,
+  print_paths: true,
+  dry_run: false
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: extract_img [options]\nReads STDIN (pipe) or one/more input files/globs with -i and extracts data:image/*;base64 images."
+
+  opts.on("-iPATH", "--input=PATH", "Input file or glob (can be passed multiple times)") do |p|
+    options[:inputs] << p
+  end
+
+  opts.on("-oDIR", "--out=DIR", "Output directory (default: current directory)") do |d|
+    options[:output_dir] = d
+  end
+
+  opts.on("--[no-]overwrite", "Overwrite existing files (default: false)") do |v|
+    options[:overwrite] = v
+  end
+
+  opts.on("--[no-]detect-formats", "Derive extension from MIME type (default: true)") do |v|
+    options[:detect_formats] = v
+  end
+
+  opts.on("--any-data", "Extract any base64 encoded data: URLs (data:/*;base64) instead of images-only") do
+    options[:extract_scope] = "any_data"
+  end
+
+  opts.on("--[no-]print-paths", "Print extracted file paths to stdout (default: true)") do |v|
+    options[:print_paths] = v
+  end
+
+  opts.on("--dry-run", "Dry run: show actions without writing files (default: false)") do |v|
+    options[:dry_run] = v
+  end
+
+  opts.on("-h", "--help", "Show this help") do
+    puts opts
+    exit 0
+  end
+end
+
+begin
+  parser.parse!(ARGV)
+rescue OptionParser::InvalidOption => e
+  warn e
+  exit 2
+end
+
+# Gather sources: if inputs provided, expand globs; otherwise read STDIN (if piped)
+sources = []
+
+if !options[:inputs].empty?
+  options[:inputs].each do |pat|
+    Dir.glob(pat).each { |p| sources << {path: p, content: File.read(p)} }
+  end
+elsif !$stdin.tty?
+  content = $stdin.read
+  sources << {path: "<stdin>", content: content}
+else
+  warn "No inputs and STDIN is a TTY. Provide -i or pipe text into the command."
+  exit 2
+end
+
+# Ensure output directory exists (unless dry-run)
+FileUtils.mkdir_p(options[:output_dir]) unless options[:dry_run]
+
+# MIME -> extension map for common image types
+MIME_MAP = {
+  "image/png" => "png",
+  "image/jpeg" => "jpg",
+  "image/jpg" => "jpg",
+  "image/gif" => "gif",
+  "image/webp" => "webp",
+  "image/svg+xml" => "svg",
+  "image/x-icon" => "ico",
+  "image/vnd.microsoft.icon" => "ico",
+  "image/bmp" => "bmp",
+  "image/tiff" => "tiff"
+}
+
+# Regex to find base64 data URLs. Uses multiline to allow newlines inside base64 payload.
+DATA_URL_RE = /data:([^;]+);base64,([A-Za-z0-9+\/=\n\r]+)/m
+
+counter = 1
+extracted = []
+
+sources.each do |src|
+  content = src[:content]
+
+  content.scan(DATA_URL_RE).each do |mime, b64data|
+    next if options[:extract_scope] == "images_only" && !mime.start_with?("image/")
+
+    clean_b64 = b64data.gsub(/\s+/, "")
+
+    ext = "bin"
+    if options[:detect_formats]
+      ext = MIME_MAP[mime.downcase] || begin
+        # try to derive from subtype, e.g. image/x-icon or image/svg+xml
+        if mime.include?("/")
+          sub = mime.split("/", 2)[1]
+          sub = sub.split("+").first if sub.include?("+")
+          sub = sub.gsub(/[^a-z0-9]/i, "")
+          sub.empty? ? "bin" : sub
+        else
+          "bin"
+        end
+      end
+    elsif mime.include?("/")
+      # fallback to subtype text
+      ext = mime.split("/", 2)[1].gsub(/[^a-z0-9]/i, "")
+      ext = "bin" if ext.empty?
+    end
+
+    # Build output filename using incremental scheme
+    base_name = "image_#{counter}"
+    filename = File.join(options[:output_dir], "#{base_name}.#{ext}")
+
+    if !options[:overwrite]
+      if File.exist?(filename)
+        # find next available numeric suffix
+        suffix = 1
+        while File.exist?(File.join(options[:output_dir], "#{base_name}_#{suffix}.#{ext}"))
+          suffix += 1
+        end
+        filename = File.join(options[:output_dir], "#{base_name}_#{suffix}.#{ext}")
+      end
+    end
+
+    if options[:dry_run]
+      puts "DRY-RUN: would write #{filename} (mime=#{mime})"
+    else
+      begin
+        decoded = Base64.decode64(clean_b64)
+        File.binwrite(filename, decoded)
+        puts filename if options[:print_paths]
+      rescue => e
+        warn "Failed to write #{filename}: #{e}"
+        next
+      end
+    end
+
+    extracted << {path: filename, mime: mime, source: src[:path]}
+    counter += 1
+  end
+end
+
+# Summary
+if options[:dry_run]
+  warn "Dry run complete. #{extracted.length} image(s) would be extracted."
+else
+  warn "Done. #{extracted.length} image(s) extracted to #{options[:output_dir]}."
+end
+
+exit 0
